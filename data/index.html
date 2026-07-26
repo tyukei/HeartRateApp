@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>坐禅 心拍</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: start center;
+      overflow-x: hidden;
+      overflow-y: auto;
+      padding: 44px 0;
+      background: #141510;
+      color: #e9e8df;
+      font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+      text-align: center;
+    }
+    main { width: min(600px, calc(100% - 32px)); }
+    #guide { margin: 0 auto 42px; max-width: 600px; color: #e9e8df; font-size: clamp(20px, 5.5vw, 36px); font-weight: 400; line-height: 1.45; }
+    #guide span { white-space: nowrap; }
+    #bpm { margin: 0 0 32px; font-family: ui-monospace, monospace; font-size: clamp(72px, 16vw, 110px); color: #d9dcc7; }
+    #timer { margin: 22px 0; color: #a7aa94; font-family: ui-monospace, monospace; font-size: clamp(28px, 6vw, 38px); }
+    button {
+      min-width: 150px;
+      padding: 12px 22px;
+      border: 1px solid #60654f;
+      border-radius: 0;
+      background: transparent;
+      color: #e7e5dc;
+      font: inherit;
+      font-size: 22px;
+      letter-spacing: .18em;
+      cursor: pointer;
+    }
+    button:hover { background: #24261d; }
+    #result {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      display: none;
+      place-items: center;
+      padding: 24px;
+      background: #141510;
+      overflow-y: auto;
+    }
+    #result.visible { display: grid; }
+    .result-card { width: min(600px, 100%); }
+    #result-title { margin: 0 0 22px; font-size: clamp(20px, 7vw, 52px); font-weight: 400; letter-spacing: 0; white-space: nowrap; }
+    #result-detail { margin: 0 0 32px; color: #9da18b; font-size: 18px; letter-spacing: .1em; }
+    #result-chart { width: 100%; height: auto; margin: 0 0 22px; }
+    .result-actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; }
+    #history { margin: 30px 0 0; color: #858b75; font-size: 16px; line-height: 1.9; text-align: left; }
+    #history p { margin: 0; }
+    #version { margin: 24px 0 0; color: #5f6453; font-family: ui-monospace, monospace; font-size: 13px; }
+    #result-version { margin: 20px 0 0; color: #5f6453; font-family: ui-monospace, monospace; font-size: 13px; }
+    canvas { width: 100%; height: auto; opacity: .62; }
+    #katsu {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      color: rgba(193, 72, 51, .86);
+      font-size: clamp(120px, 34vw, 280px);
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: .08em;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .15s ease;
+      text-shadow: 0 0 28px rgba(193, 72, 51, .35);
+    }
+    #katsu.visible { opacity: 1; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="guide"><span>ハートマークの面を指に</span><br><span>そっと当て、心拍を測ろう。</span></h1>
+    <div id="bpm">--</div>
+    <canvas id="c" width="600" height="230" aria-label="心拍波形"></canvas>
+    <p id="timer">01:00</p>
+    <button id="session-button" type="button">始める</button>
+    <p id="version"></p>
+  </main>
+  <div id="katsu" role="alert" aria-live="assertive">喝</div>
+  <section id="result" aria-live="polite">
+    <div class="result-card">
+      <p id="result-title"></p>
+      <p id="result-detail"></p>
+      <canvas id="result-chart" width="600" height="230" aria-label="計測中の心拍数推移"></canvas>
+      <div class="result-actions">
+        <button id="restart-button" type="button">もう一度</button>
+        <button id="home-button" type="button">ホームに戻る</button>
+      </div>
+      <div id="history" aria-label="これまでの記録"></div>
+      <p id="result-version"></p>
+    </div>
+  </section>
+  <script>
+    const cv = document.getElementById('c');
+    const ctx = cv.getContext('2d');
+    const data = new Array(600).fill(2048);
+    const bpmElement = document.getElementById('bpm');
+    const katsuElement = document.getElementById('katsu');
+    const timerElement = document.getElementById('timer');
+    const sessionButton = document.getElementById('session-button');
+    const resultElement = document.getElementById('result');
+    const resultTitle = document.getElementById('result-title');
+    const resultDetail = document.getElementById('result-detail');
+    const restartButton = document.getElementById('restart-button');
+    const homeButton = document.getElementById('home-button');
+    const historyElement = document.getElementById('history');
+    const resultChart = document.getElementById('result-chart');
+    const resultChartContext = resultChart.getContext('2d');
+    const versionElement = document.getElementById('version');
+    const resultVersionElement = document.getElementById('result-version');
+    const APP_VERSION = 'v0.1.0';
+    const MAX_BPM = 100;
+    const SUDDEN_CHANGE_BPM = 20;
+    const SESSION_LENGTH_MS = 60_000;
+    const HISTORY_KEY = 'zazen-heart-rate-history';
+    let previousBpm = 0;
+    let katsuUntil = 0;
+    let sessionActive = false;
+    let sessionStartedAt = 0;
+    let disturbanceActive = false;
+    let katsuCount = 0;
+    let audioContext;
+    let sessionBpmSamples = [];
+    let lastBpmSampleAt = 0;
+
+    versionElement.textContent = `ZAZEN HEART RATE ${APP_VERSION}`;
+    resultVersionElement.textContent = `ZAZEN HEART RATE ${APP_VERSION}`;
+
+    function getHistory() {
+      try {
+        return JSON.parse(localStorage.getItem(HISTORY_KEY)) || [];
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function renderHistory() {
+      const history = getHistory();
+      historyElement.replaceChildren();
+      if (history.length === 0) return;
+      const heading = document.createElement('p');
+      heading.textContent = 'これまでの記録';
+      historyElement.append(heading);
+      history.slice(0, 5).forEach((entry) => {
+        const item = document.createElement('p');
+        item.textContent = `${entry.date}　${entry.result}　喝 ${entry.katsuCount}回`;
+        historyElement.append(item);
+      });
+    }
+
+    function saveResult(result, elapsedSeconds) {
+      const history = getHistory();
+      history.unshift({
+        date: new Date().toLocaleString('ja-JP'),
+        result,
+        katsuCount,
+        elapsedSeconds,
+        samples: sessionBpmSamples,
+      });
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 20)));
+      renderHistory();
+    }
+
+    function prepareAudio() {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      audioContext ??= new AudioContextClass();
+      audioContext.resume();
+    }
+
+    function playKatsuSound() {
+      if (!audioContext || audioContext.state !== 'running') return;
+      const now = audioContext.currentTime;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = 'triangle';
+      oscillator.frequency.setValueAtTime(190, now);
+      oscillator.frequency.exponentialRampToValueAtTime(90, now + .16);
+      gain.gain.setValueAtTime(.0001, now);
+      gain.gain.exponentialRampToValueAtTime(.16, now + .008);
+      gain.gain.exponentialRampToValueAtTime(.0001, now + .2);
+      oscillator.connect(gain).connect(audioContext.destination);
+      oscillator.start(now);
+      oscillator.stop(now + .21);
+    }
+
+    function isDisturbed(bpm) {
+      const outsideRestingRange = bpm >= MAX_BPM;
+      const suddenChange = previousBpm > 0 && Math.abs(bpm - previousBpm) >= SUDDEN_CHANGE_BPM;
+      previousBpm = bpm;
+      return outsideRestingRange || suddenChange;
+    }
+
+    function showKatsu() {
+      katsuUntil = Date.now() + 1300;
+      katsuElement.classList.add('visible');
+      playKatsuSound();
+    }
+
+    function formatTime(milliseconds) {
+      return `00:${String(Math.ceil(milliseconds / 1000)).padStart(2, '0')}`;
+    }
+
+    function startSession() {
+      sessionActive = true;
+      sessionStartedAt = Date.now();
+      disturbanceActive = false;
+      katsuCount = 0;
+      previousBpm = 0;
+      sessionBpmSamples = [];
+      lastBpmSampleAt = 0;
+      prepareAudio();
+      data.fill(2048);
+      timerElement.textContent = '01:00';
+      sessionButton.textContent = '終える';
+    }
+
+    function drawResultChart(elapsedSeconds) {
+      const context = resultChartContext;
+      const width = resultChart.width;
+      const height = resultChart.height;
+      const left = 42;
+      const right = 12;
+      const top = 18;
+      const bottom = 32;
+      const chartWidth = width - left - right;
+      const chartHeight = height - top - bottom;
+      context.clearRect(0, 0, width, height);
+
+      if (sessionBpmSamples.length === 0) {
+        context.fillStyle = '#858b75';
+        context.font = '14px sans-serif';
+        context.textAlign = 'center';
+        context.fillText('心拍データを取得できませんでした', width / 2, height / 2);
+        return;
+      }
+
+      const readings = sessionBpmSamples.map((sample) => sample.bpm);
+      const minimum = Math.max(30, Math.floor((Math.min(...readings) - 10) / 10) * 10);
+      const maximum = Math.max(minimum + 20, Math.ceil((Math.max(...readings) + 10) / 10) * 10);
+      const xFor = (seconds) => left + (seconds / Math.max(elapsedSeconds, 1)) * chartWidth;
+      const yFor = (bpm) => top + (1 - (bpm - minimum) / (maximum - minimum)) * chartHeight;
+
+      context.strokeStyle = '#34382c';
+      context.lineWidth = 1;
+      for (let line = 0; line <= 4; line++) {
+        const y = top + (chartHeight / 4) * line;
+        context.beginPath();
+        context.moveTo(left, y);
+        context.lineTo(width - right, y);
+        context.stroke();
+      }
+
+      context.fillStyle = '#858b75';
+      context.font = '11px ui-monospace, monospace';
+      context.textAlign = 'right';
+      context.fillText(`${maximum} BPM`, left - 7, top + 4);
+      context.fillText(`${minimum} BPM`, left - 7, top + chartHeight);
+      context.textAlign = 'left';
+      context.fillText('0秒', left, height - 8);
+      context.textAlign = 'right';
+      context.fillText(`${elapsedSeconds}秒`, width - right, height - 8);
+
+      context.beginPath();
+      sessionBpmSamples.forEach((sample, index) => {
+        const x = xFor(sample.seconds);
+        const y = yFor(sample.bpm);
+        index === 0 ? context.moveTo(x, y) : context.lineTo(x, y);
+      });
+      context.strokeStyle = '#b2b995';
+      context.lineWidth = 2;
+      context.stroke();
+    }
+
+    function endSession() {
+      if (!sessionActive) return;
+      sessionActive = false;
+      sessionButton.textContent = '始める';
+      katsuElement.classList.remove('visible');
+      const elapsedSeconds = Math.min(60, Math.ceil((Date.now() - sessionStartedAt) / 1000));
+      const settled = katsuCount === 0;
+      const result = settled ? '精神が統一されている！' : '精神が乱れている！';
+      resultTitle.textContent = result;
+      resultDetail.textContent = `計測時間 ${elapsedSeconds}秒 ・ 喝 ${katsuCount}回`;
+      drawResultChart(elapsedSeconds);
+      saveResult(result, elapsedSeconds);
+      resultElement.classList.add('visible');
+    }
+
+    function updateSessionTimer() {
+      if (!sessionActive) return;
+      const remaining = SESSION_LENGTH_MS - (Date.now() - sessionStartedAt);
+      timerElement.textContent = formatTime(Math.max(0, remaining));
+      if (remaining <= 0) endSession();
+    }
+
+    async function tick() {
+      try {
+        const response = await fetch('/data');
+        const reading = await response.json();
+        data.push(reading.signal);
+        data.shift();
+        if (reading.bpm > 0) {
+          bpmElement.textContent = `${reading.bpm} BPM`;
+          if (sessionActive && Date.now() - lastBpmSampleAt >= 1000) {
+            sessionBpmSamples.push({
+              seconds: (Date.now() - sessionStartedAt) / 1000,
+              bpm: reading.bpm,
+            });
+            lastBpmSampleAt = Date.now();
+          }
+          const disturbed = isDisturbed(reading.bpm);
+          if (sessionActive && disturbed && !disturbanceActive) {
+            katsuCount++;
+            showKatsu();
+          }
+          disturbanceActive = disturbed;
+        }
+        if (Date.now() >= katsuUntil) katsuElement.classList.remove('visible');
+        draw();
+      } catch (error) {
+        // Keep the last visible reading while the device reconnects.
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.beginPath();
+      ctx.strokeStyle = '#b2b995';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < data.length; i++) {
+        const y = cv.height - (data[i] / 4095) * cv.height;
+        i === 0 ? ctx.moveTo(i, y) : ctx.lineTo(i, y);
+      }
+      ctx.stroke();
+    }
+
+    sessionButton.addEventListener('click', () => {
+      if (sessionActive) endSession();
+      else startSession();
+    });
+    restartButton.addEventListener('click', () => {
+      resultElement.classList.remove('visible');
+      startSession();
+    });
+    homeButton.addEventListener('click', () => {
+      resultElement.classList.remove('visible');
+      timerElement.textContent = '01:00';
+      sessionButton.textContent = '始める';
+    });
+
+    renderHistory();
+    setInterval(tick, 20);
+    setInterval(updateSessionTimer, 250);
+  </script>
+</body>
+</html>
