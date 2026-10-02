@@ -25,6 +25,10 @@
     #guide span { white-space: nowrap; }
     #bpm { margin: 0 0 32px; font-family: ui-monospace, monospace; font-size: clamp(72px, 16vw, 110px); color: #d9dcc7; }
     #timer { margin: 22px 0; color: #a7aa94; font-family: ui-monospace, monospace; font-size: clamp(28px, 6vw, 38px); }
+    #katsu-rule { margin: -18px auto 26px; max-width: 620px; color: #8d907c; font-size: clamp(13px, 3.2vw, 15px); line-height: 1.7; }
+    #katsu-rule b { color: #b9bca6; font-weight: 600; font-variant-numeric: tabular-nums; }
+    #katsu-rule .live { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: #23261d; color: #a7aa94; font-family: ui-monospace, monospace; font-size: 0.92em; }
+    #katsu-rule .near { background: #4a3a1c; color: #e6c67a; }
     button {
       min-width: 150px;
       padding: 12px 22px;
@@ -81,6 +85,11 @@
   <main>
     <h1 id="guide"><span>ハートマークの面を指に</span><br><span>そっと当て、心拍を測ろう。</span></h1>
     <div id="bpm">--</div>
+    <p id="katsu-rule">
+      <b id="rule-max">--</b> 以上、または直前から <b id="rule-change">--</b> 以上の変化で「喝」
+      <br>いまの心拍 <span class="live" id="live-bpm">--</span>
+      変化 <span class="live" id="live-delta">--</span>
+    </p>
     <canvas id="c" width="600" height="230" aria-label="心拍波形"></canvas>
     <p id="timer">01:00</p>
     <button id="session-button" type="button">始める</button>
@@ -104,6 +113,9 @@
     const cv = document.getElementById('c');
     const ctx = cv.getContext('2d');
     const data = new Array(600).fill(2048);
+    // 受信済みでまだ波形に流していないサンプル。描画ループが一定速度で消費する。
+    const pendingSamples = [];
+    const SAMPLE_INTERVAL_MS = 20;  // ESP32 側の記録間隔と揃える
     const bpmElement = document.getElementById('bpm');
     const katsuElement = document.getElementById('katsu');
     const timerElement = document.getElementById('timer');
@@ -123,6 +135,13 @@
     const SUDDEN_CHANGE_BPM = 20;
     const SESSION_LENGTH_MS = 60_000;
     const HISTORY_KEY = 'zazen-heart-rate-history';
+    // スタックちゃん(ハリセン)の宛先。既定値は下を書き換える。
+    // 現地で変えたいときは ?stackchan=192.168.128.251 を付けて開けば localStorage に保存され、
+    // 以降そちらが使われる(uploadfs のやり直し不要)。?stackchan= で連携オフ。
+    const STACKCHAN_KEY = 'zazen-stackchan-url';
+    const STACKCHAN_DEFAULT_URL = 'http://10.87.42.215';
+    const STACKCHAN_COOLDOWN_MS = 2000;
+    let stackchanReadyAt = 0;
     let previousBpm = 0;
     let katsuUntil = 0;
     let sessionActive = false;
@@ -194,17 +213,64 @@
       oscillator.stop(now + .21);
     }
 
+    // 判定に使う定数をそのまま画面へ出す(値と表示がずれないよう定数から生成)
+    document.getElementById('rule-max').textContent = `${MAX_BPM} BPM`;
+    document.getElementById('rule-change').textContent = `${SUDDEN_CHANGE_BPM} BPM`;
+    const liveBpmElement = document.getElementById('live-bpm');
+    const liveDeltaElement = document.getElementById('live-delta');
+
+    function updateKatsuRule(bpm, delta) {
+      liveBpmElement.textContent = `${bpm} BPM`;
+      liveBpmElement.classList.toggle('near', bpm >= MAX_BPM);
+      liveDeltaElement.textContent = delta === null ? '--' : `${delta >= 0 ? '+' : ''}${delta}`;
+      liveDeltaElement.classList.toggle('near', delta !== null && Math.abs(delta) >= SUDDEN_CHANGE_BPM);
+    }
+
     function isDisturbed(bpm) {
       const outsideRestingRange = bpm >= MAX_BPM;
-      const suddenChange = previousBpm > 0 && Math.abs(bpm - previousBpm) >= SUDDEN_CHANGE_BPM;
+      const delta = previousBpm > 0 ? bpm - previousBpm : null;
+      const suddenChange = delta !== null && Math.abs(delta) >= SUDDEN_CHANGE_BPM;
+      updateKatsuRule(bpm, delta);
       previousBpm = bpm;
       return outsideRestingRange || suddenChange;
+    }
+
+    function getStackchanUrl() {
+      const override = new URLSearchParams(location.search).get('stackchan');
+      if (override !== null) {
+        const url = override && !override.startsWith('http') ? `http://${override}` : override;
+        try { localStorage.setItem(STACKCHAN_KEY, url); } catch (error) { /* ignore */ }
+        return url;
+      }
+      try {
+        return localStorage.getItem(STACKCHAN_KEY) ?? STACKCHAN_DEFAULT_URL;
+      } catch (error) {
+        return STACKCHAN_DEFAULT_URL;
+      }
+    }
+
+    function swingHarisen() {
+      const base = getStackchanUrl();
+      if (!base) return;
+      // 連打でサーボが追従できなくなるのを防ぐ
+      if (Date.now() < stackchanReadyAt) return;
+      stackchanReadyAt = Date.now() + STACKCHAN_COOLDOWN_MS;
+      // カスタムヘッダ無しの GET = CORS プリフライトなし。
+      // スタックちゃん側が Access-Control-Allow-Origin を返すので、失敗はコンソールで確認できる。
+      // タイムアウト必須: スタックちゃんはサーボ補間中に応答が遅れることがあり、
+      // 放置すると接続が残って /data のポーリングを圧迫し BPM 表示が固まる。
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1000);
+      fetch(`${base}/harisen?t=${Date.now()}`, { cache: 'no-store', signal: controller.signal })
+        .catch((error) => console.warn('stackchan unreachable:', error))
+        .finally(() => clearTimeout(timer));
     }
 
     function showKatsu() {
       katsuUntil = Date.now() + 1300;
       katsuElement.classList.add('visible');
       playKatsuSound();
+      swingHarisen();
     }
 
     function formatTime(milliseconds) {
@@ -306,10 +372,20 @@
 
     async function tick() {
       try {
-        const response = await fetch('/data');
+        // 応答が遅いときに待ち続けないよう打ち切る。次の周回で取り直せばよい。
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        const response = await fetch('/data', { signal: controller.signal });
+        clearTimeout(timer);
         const reading = await response.json();
-        data.push(reading.signal);
-        data.shift();
+        // ESP32 は 1 リクエストで複数サンプルを返す(signals)。
+        // 旧形式(signal 単体)も一応受ける。
+        const samples = Array.isArray(reading.signals)
+          ? reading.signals
+          : reading.signal != null ? [reading.signal] : [];
+        // ここでは待ち行列に積むだけ。波形へ流し込むのは描画ループ側で、
+        // 一定速度で消費することで通信間隔(200ms)とは無関係に滑らかに流れる。
+        pendingSamples.push(...samples);
         if (reading.bpm > 0) {
           bpmElement.textContent = `${reading.bpm} BPM`;
           if (sessionActive && Date.now() - lastBpmSampleAt >= 1000) {
@@ -327,7 +403,6 @@
           disturbanceActive = disturbed;
         }
         if (Date.now() >= katsuUntil) katsuElement.classList.remove('visible');
-        draw();
       } catch (error) {
         // Keep the last visible reading while the device reconnects.
       }
@@ -359,8 +434,49 @@
       sessionButton.textContent = '始める';
     });
 
+    // 描画は通信から切り離して 60fps で回す。
+    // tick() の中で draw() を呼ぶと、ポーリング間隔がそのまま frame rate になり
+    // 200ms 周期 = 5fps でカクついていた。
+    let sampleDebt = 0;
+    let lastFrameAt = 0;
+    function renderLoop(now) {
+      requestAnimationFrame(renderLoop);
+      if (!lastFrameAt) lastFrameAt = now;
+      const elapsed = now - lastFrameAt;
+      lastFrameAt = now;
+
+      // 経過時間ぶんだけ消費する = ESP32 の記録速度と同じペースで流れる
+      sampleDebt = Math.min(sampleDebt + elapsed / SAMPLE_INTERVAL_MS, 60);
+      let take = Math.floor(sampleDebt);
+      sampleDebt -= take;
+      // 通信が詰まって溜まった場合は早送りで追いつく
+      if (pendingSamples.length > 100) {
+        take = Math.max(take, Math.ceil(pendingSamples.length / 10));
+      }
+      take = Math.min(take, pendingSamples.length);
+      if (take > 0) {
+        for (let i = 0; i < take; i++) {
+          data.push(pendingSamples[i]);
+          data.shift();
+        }
+        pendingSamples.splice(0, take);
+        draw();
+      }
+    }
+    requestAnimationFrame(renderLoop);
+
     renderHistory();
-    setInterval(tick, 20);
+    // setInterval だと応答が遅いときに未完了のリクエストが積み上がる。
+    // テザリング経由では 1 件に 1 秒近くかかることがあり、200ms 間隔で投げ続けると
+    // ESP32(1 接続ずつしか捌けない)の前に行列ができてページごと固まる。
+    // 前の 1 件が終わってから次を投げる方式にして、回線の速さに自動で追従させる。
+    const POLL_GAP_MS = 200;
+    (async function pollLoop() {
+      for (;;) {
+        await tick();
+        await new Promise((resolve) => setTimeout(resolve, POLL_GAP_MS));
+      }
+    })();
     setInterval(updateSessionTimer, 250);
   </script>
 </body>
